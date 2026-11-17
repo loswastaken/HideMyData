@@ -1,3 +1,20 @@
+# Fork (unreleased)
+
+* Fix redaction boxes landing in the wrong place on rotated pages and pages with a non-zero page origin.
+* Fix cropped-out page content being exposed on export.
+* Fix permission-restricted PDFs showing no redactions while reporting success.
+* Ask for the password of locked PDFs instead of exporting blank pages.
+* OCR every page and place boxes by pixels as well as by the text layer (fixes scans whose hidden text layer is misplaced, undersized or partial).
+* Blur style: mosaic before blur so small pages stay unreadable; blurred regions are verified on export.
+* Detect no longer removes manually drawn boxes.
+* Saving asks for confirmation when detected items could not be located.
+* Fix export of very large pages.
+* Report detected items that could not be located, and pages that could not be read, as warnings.
+* Verify the exported PDF before saving; refuse to save if verification fails.
+* Every page is rasterized on export, including pages without redactions.
+* Remove Sparkle auto-update; new bundle id `com.loswastaken.hidemydata`; signed to run locally.
+* Add a test suite with protected, rotated, cropped and scanned fixtures.
+
 # 0.2.0
 
 ## HideMyData is now notarized!

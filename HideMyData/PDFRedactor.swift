@@ -1,8 +1,6 @@
 import Foundation
 import PDFKit
 import AppKit
-import CoreImage
-import CoreImage.CIFilterBuiltins
 internal import UniformTypeIdentifiers
 
 enum RedactionStyle: String, CaseIterable, Identifiable {
@@ -43,6 +41,29 @@ enum EditingMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum PDFExportError: LocalizedError, Equatable {
+    case noDocument
+    case busy
+    case inconsistentRedactions
+    case renderFailed(page: Int)
+    case writeFailed
+    case verificationFailed([String])
+    case moveFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noDocument: return "No document to export"
+        case .busy: return "Wait for detection to finish before saving"
+        case .inconsistentRedactions: return "Export refused: a redaction is no longer attached to its page"
+        case .renderFailed(let page): return "Export failed: page \(page + 1) could not be rendered"
+        case .writeFailed: return "Could not write redacted PDF"
+        case .verificationFailed(let problems):
+            return "Export refused — verification failed: " + problems.prefix(3).joined(separator: "; ")
+        case .moveFailed(let reason): return "Could not save the verified PDF: \(reason)"
+        }
+    }
+}
+
 @Observable
 @MainActor
 final class PDFRedactor {
@@ -50,46 +71,87 @@ final class PDFRedactor {
         case empty
         case loaded
         case detecting
-        case redacted(spanCount: Int, rectCount: Int)
+        case detected(PDFDetectionReport)
         case saved(URL)
         case failed(String)
     }
 
+    enum RedactionSource { case auto, manual }
+
+    struct TrackedRedaction {
+        let page: PDFPage
+        let annotation: PDFAnnotation
+        let source: RedactionSource
+    }
+
     var phase: Phase = .empty
+    /// The sanitized working copy (see `PDFNormalizer`). Redaction annotations live here.
     var document: PDFDocument?
     var sourceURL: URL?
     var editingMode: EditingMode = .view
     var redactionStyle: RedactionStyle = .blackRectangle {
         didSet { if oldValue != redactionStyle { restyleAllAnnotations() } }
     }
+    /// Result of the last detection run on this document; survives manual edits and saves so
+    /// the status can keep saying what still needs manual review.
+    private(set) var detectionReport: PDFDetectionReport?
 
-    private var redactionAnnotations: [(page: PDFPage, annotation: PDFAnnotation)] = []
-    private let blurCache: NSCache<PDFPage, CGImage> = {
+    @ObservationIgnored var passwordProvider: PDFPasswordProvider
+    /// Upper bound on password prompts per open, so a misbehaving provider cannot loop forever.
+    @ObservationIgnored var maxPasswordAttempts = 20
+    /// Test seam: called with the temporary export file after it is written and before it is
+    /// verified (tests use it to corrupt the file and prove verification stops the save).
+    @ObservationIgnored var afterTemporaryWrite: ((URL) -> Void)?
+
+    /// Never-annotated twin of `document`, used for all rendering (OCR, blur preview, export),
+    /// so redaction annotations never have to be detached and re-attached.
+    @ObservationIgnored var pristineDocument: PDFDocument?
+    @ObservationIgnored private var sourceAttributes: [AnyHashable: Any] = [:]
+
+    private(set) var redactions: [TrackedRedaction] = []
+    /// Sharp renders of pristine pages (for the blur preview), keyed by working page.
+    private let renderCache: NSCache<PDFPage, CGImage> = {
         let cache = NSCache<PDFPage, CGImage>()
-        cache.countLimit = 8
+        cache.countLimit = 4
         return cache
     }()
-    private var detectionTask: Task<Void, Never>?
+    @ObservationIgnored private var detectionTask: Task<Void, Never>?
+
+    init(passwordProvider: @escaping PDFPasswordProvider = { name, failed in
+        PDFPasswordPrompt.ask(documentName: name, previousAttemptFailed: failed)
+    }) {
+        self.passwordProvider = passwordProvider
+    }
 
     var statusText: String {
+        let count = "\(redactionCount) redaction\(redactionCount == 1 ? "" : "s")"
         switch phase {
         case .empty: return "No document"
         case .loaded:
-            if redactionAnnotations.isEmpty { return "Loaded" }
-            return "\(redactionAnnotations.count) rectangle\(redactionAnnotations.count == 1 ? "" : "s")"
+            return redactions.isEmpty ? "Loaded" : count
         case .detecting: return "Detecting PII…"
-        case .redacted(_, let r):
-            return "\(r) redaction\(r == 1 ? "" : "s")"
-        case .saved(let url): return "Saved → \(url.lastPathComponent)"
+        case .detected(let report):
+            if let review = report.reviewSummary { return "\(count); \(review)" }
+            let base = redactionCount == 0 ? (report.detectedSpanCount == 0 ? "No personal data found" : "No redactions") : count
+            return report.notice.map { "\(base); \($0)" } ?? base
+        case .saved(let url):
+            if let review = detectionReport?.reviewSummary { return "Saved → \(url.lastPathComponent); \(review)" }
+            return "Saved → \(url.lastPathComponent)"
         case .failed(let m): return "Failed: \(m)"
         }
     }
 
-    var hasRedactions: Bool { !redactionAnnotations.isEmpty }
+    var hasRedactions: Bool { !redactions.isEmpty }
     var canDetect: Bool { document != nil && phase != .detecting }
-    var redactionCount: Int { redactionAnnotations.count }
+    /// Number of redactions confirmed attached to their pages (only attached ones are tracked).
+    var redactionCount: Int { redactions.count }
 
-    // MARK: - Open / Save
+    /// Tracked redaction bounds for a page (page space), optionally filtered by source.
+    func redactionRects(on page: PDFPage, source: RedactionSource? = nil) -> [CGRect] {
+        redactions.filter { $0.page === page && (source == nil || $0.source == source) }.map { $0.annotation.bounds }
+    }
+
+    // MARK: - Open
 
     @discardableResult
     func openPDF() -> Bool {
@@ -107,13 +169,7 @@ final class PDFRedactor {
             phase = .failed("Could not open PDF at \(url.lastPathComponent)")
             return false
         }
-        cancelDetection()
-        clearRedactions(silently: true)
-        blurCache.removeAllObjects()
-        self.document = doc
-        self.sourceURL = url
-        self.phase = .loaded
-        return true
+        return ingest(doc, name: url.lastPathComponent, sourceURL: url)
     }
 
     /// Load a PDF whose bytes are already in memory. Used by the recents flow so the
@@ -125,17 +181,55 @@ final class PDFRedactor {
             phase = .failed("Could not open PDF at \(originalURL.lastPathComponent)")
             return false
         }
+        return ingest(doc, name: originalURL.lastPathComponent, sourceURL: originalURL)
+    }
+
+    /// Unlock (if needed) and normalize. On failure the previous document stays open and
+    /// `phase` explains why; a locked or unreadable file never becomes a blank document.
+    private func ingest(_ source: PDFDocument, name: String, sourceURL: URL) -> Bool {
+        guard unlockIfNeeded(source, name: name) else {
+            phase = .failed("Password required to open \(name)")
+            return false
+        }
+        let working: PDFDocument
+        let pristine: PDFDocument
+        do {
+            let data = try PDFNormalizer.normalizedData(source)
+            working = try PDFNormalizer.open(data, expectedPageCount: source.pageCount)
+            pristine = try PDFNormalizer.open(data, expectedPageCount: source.pageCount)
+        } catch {
+            phase = .failed("Could not open \(name): \(error.localizedDescription)")
+            return false
+        }
         cancelDetection()
-        clearRedactions(silently: true)
-        blurCache.removeAllObjects()
-        self.document = doc
-        self.sourceURL = originalURL
-        self.phase = .loaded
+        removeRedactions { _ in true }
+        renderCache.removeAllObjects()
+        sourceAttributes = source.documentAttributes ?? [:]
+        pristineDocument = pristine
+        document = working
+        detectionReport = nil
+        self.sourceURL = sourceURL
+        phase = .loaded
         return true
     }
 
+    private func unlockIfNeeded(_ doc: PDFDocument, name: String) -> Bool {
+        guard doc.isLocked else { return true }
+        if doc.unlock(withPassword: ""), !doc.isLocked { return true }
+        var previousFailed = false
+        for _ in 0..<maxPasswordAttempts {
+            guard let password = passwordProvider(name, previousFailed) else { return false }
+            if doc.unlock(withPassword: password), !doc.isLocked { return true }
+            previousFailed = true
+        }
+        return false
+    }
+
+    // MARK: - Save / export
+
     func save() {
         guard document != nil else { return }
+        if let report = detectionReport, report.needsManualReview, !confirmSaveDespiteReview(report) { return }
         let panel = NSSavePanel()
         let exportAccessory = ExportOptionsAccessoryView()
         panel.allowedContentTypes = [.pdf]
@@ -143,17 +237,112 @@ final class PDFRedactor {
         panel.nameFieldStringValue = suggestedSaveName()
         panel.accessoryView = exportAccessory
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        export(to: url, options: exportAccessory.options)
+    }
 
-        if let outURL = saveSecurely(to: url, options: exportAccessory.options) {
-            phase = .saved(outURL)
+    /// Asks before saving a document in which detection could not redact everything.
+    /// Cancel is the default button.
+    private func confirmSaveDespiteReview(_ report: PDFDetectionReport) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Some detected personal data may not be redacted"
+        alert.informativeText = (report.reviewSummary ?? "") + ".\n\nAdd redactions for these items manually before saving, or save anyway."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Save Anyway")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    /// Rasterizes the redacted document, writes it to a temporary file, reopens and verifies
+    /// that file, and only then moves it to `url`. Sets `phase` to `.saved` or `.failed`.
+    @discardableResult
+    func export(to url: URL, options: ExportOptions) -> Result<URL, PDFExportError> {
+        let result = buildVerifiedExport(to: url, options: options)
+        switch result {
+        case .success(let out): phase = .saved(out)
+        case .failure(let error): phase = .failed(error.localizedDescription)
+        }
+        return result
+    }
+
+    private func buildVerifiedExport(to url: URL, options: ExportOptions) -> Result<URL, PDFExportError> {
+        guard let doc = document, let pristine = pristineDocument else { return .failure(.noDocument) }
+        if phase == .detecting { return .failure(.busy) }
+
+        // Every tracked redaction must still be on its page; otherwise the view and the
+        // export would disagree.
+        for item in redactions where !item.page.annotations.contains(where: { $0 === item.annotation }) {
+            return .failure(.inconsistentRedactions)
+        }
+
+        var expectation = PDFExportExpectation(pages: [])
+        let writer = ImagePDFWriter()
+        for pageIndex in 0..<doc.pageCount {
+            guard let page = doc.page(at: pageIndex), let clean = pristine.page(at: pageIndex) else {
+                return .failure(.renderFailed(page: pageIndex))
+            }
+            let rects = redactionRects(on: page)
+            let size = page.bounds(for: .mediaBox).size
+
+            // Every page is rasterized, including pages without redactions and with
+            // "Remove metadata" off: a vector copy would still carry content the user
+            // cannot see (text clipped away by the original crop box, white text,
+            // hidden layers), which detection never looked at.
+            let added = autoreleasepool { () -> Bool in
+                guard let baked = bakedImage(clean, rects: rects, style: redactionStyle) else { return false }
+                return writer.addPage(baked, size: size)
+            }
+            guard added else { return .failure(.renderFailed(page: pageIndex)) }
+            let isBlack = redactionStyle == .blackRectangle
+            expectation.pages.append(.init(size: size, baked: true, blackRects: isBlack ? rects : [], blurRects: isBlack ? [] : rects))
+        }
+        guard let newDoc = writer.finish() else { return .failure(.writeFailed) }
+        newDoc.documentAttributes = options.removeMetadata ? [:] : sourceAttributes
+
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory.appendingPathComponent("HideMyData-export-\(UUID().uuidString).pdf")
+        defer { try? fm.removeItem(at: tmp) }
+        guard newDoc.write(to: tmp) else { return .failure(.writeFailed) }
+        afterTemporaryWrite?(tmp)
+
+        let problems = PDFExportVerifier.problems(inFileAt: tmp, expected: expectation)
+        guard problems.isEmpty else { return .failure(.verificationFailed(problems)) }
+
+        do {
+            try Self.moveVerifiedFile(tmp, to: url)
+        } catch {
+            return .failure(.moveFailed(error.localizedDescription))
+        }
+        return .success(url)
+    }
+
+    /// Moves the verified temp file into place, replacing an existing file, and checks that
+    /// the bytes at the destination are exactly the verified bytes.
+    private static func moveVerifiedFile(_ tmp: URL, to url: URL) throws {
+        let fm = FileManager.default
+        let verified = try Data(contentsOf: tmp)
+        if fm.fileExists(atPath: url.path) {
+            do {
+                _ = try fm.replaceItemAt(url, withItemAt: tmp)
+            } catch {
+                // replaceItemAt can be refused inside the sandbox; the destination itself
+                // is writable (user-selected), so overwrite it in place.
+                try verified.write(to: url)
+            }
         } else {
-            phase = .failed("Could not write redacted PDF")
+            do {
+                try fm.moveItem(at: tmp, to: url)
+            } catch {
+                try verified.write(to: url)
+            }
+        }
+        guard (try? Data(contentsOf: url)) == verified else {
+            throw HMDError.message("the file on disk does not match the verified export")
         }
     }
 
-    // MARK: - Detection
+    // MARK: - Detection entry points (the pipeline is in PDFRedactor+Detection.swift)
 
-    func detectAndRedact(using detector: PIIDetector) {
+    func detectAndRedact(using detector: any PIIDetecting) {
         cancelDetection()
         detectionTask = Task { [weak self] in
             await self?.runDetection(using: detector)
@@ -165,380 +354,218 @@ final class PDFRedactor {
         detectionTask = nil
     }
 
-    private func runDetection(using detector: PIIDetector) async {
-        guard let doc = document else { return }
-        clearRedactions(silently: true)
+    func beginDetection() {
+        // Detection replaces only its own earlier results; manual redactions stay.
+        removeRedactions { $0.source == .auto }
+        detectionReport = nil
         phase = .detecting
-
-        var totalSpans = 0
-        var totalRects = 0
-
-        for pageIndex in 0..<doc.pageCount {
-            if Task.isCancelled { return }
-            guard let page = doc.page(at: pageIndex) else { continue }
-
-            let pageText = page.string ?? ""
-            let source: PageTextSource
-            let modelInput: String
-            let offsetMap: [Int]
-            if pageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                guard let ocrPage = await ocrText(for: page) else { continue }
-                if ocrPage.combinedText.isEmpty { continue }
-                source = .ocr(ocrPage)
-                let n = OCRNormalizer.normalize(ocrPage.combinedText)
-                modelInput = n.text
-                offsetMap = n.offsetMap
-            } else {
-                source = .nativeText(pageText)
-                modelInput = pageText
-                offsetMap = []
-            }
-            let result = await detector.detect(modelInput)
-            if Task.isCancelled { return }
-            switch result {
-            case .failure(let err):
-                phase = .failed("Inference error on page \(pageIndex + 1): \(err.localizedDescription)")
-                return
-            case .success(let spans):
-                totalSpans += spans.count
-                var unmapped: [DetectedSpan] = []
-                for span in spans {
-                    let (s, e) = OCRNormalizer.translateRange(
-                        start: span.start, end: span.end, map: offsetMap, originalCount: source.text.count
-                    )
-                    let translated = DetectedSpan(
-                        category: span.category, text: span.text,
-                        start: s, end: e, confidence: span.confidence
-                    )
-                    let rects = boundingRects(for: translated, source: source, on: page)
-                    if rects.isEmpty {
-                        unmapped.append(translated)
-                    } else {
-                        for rect in rects {
-                            addRedaction(rect: rect, on: page, source: .auto)
-                            totalRects += 1
-                        }
-                    }
-                }
-                if !unmapped.isEmpty, case .nativeText = source {
-                    let recovered = await rectsViaOCRFallback(for: unmapped, on: page)
-                    for (rect, _) in recovered {
-                        addRedaction(rect: rect, on: page, source: .auto)
-                        totalRects += 1
-                    }
-                }
-            }
-        }
-
-        phase = .redacted(spanCount: totalSpans, rectCount: totalRects)
     }
 
-    private enum PageTextSource {
-        case nativeText(String)
-        case ocr(OCRPage)
-
-        var text: String {
-            switch self {
-            case .nativeText(let s): return s
-            case .ocr(let p): return p.combinedText
-            }
-        }
-    }
-
-    private func ocrText(for page: PDFPage) async -> OCRPage? {
-        guard let cg = renderPageToCGImage(page, scale: 2) else { return nil }
-        return try? await OCREngine.recognize(cg)
-    }
-
-    private func renderPageToCGImage(_ page: PDFPage, scale: CGFloat) -> CGImage? {
-        let pageBounds = page.bounds(for: .mediaBox)
-        let pixelWidth = Int(pageBounds.width * scale)
-        let pixelHeight = Int(pageBounds.height * scale)
-        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
-
-        let detached = redactionAnnotations.filter { $0.page === page }.map { $0.annotation }
-        for ann in detached { page.removeAnnotation(ann) }
-        defer { for ann in detached { page.addAnnotation(ann) } }
-
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil, width: pixelWidth, height: pixelHeight,
-            bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        ctx.setFillColor(NSColor.white.cgColor)
-        ctx.fill(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
-        ctx.scaleBy(x: scale, y: scale)
-        page.draw(with: .mediaBox, to: ctx)
-        return ctx.makeImage()
+    func finishDetection(_ report: PDFDetectionReport) {
+        refreshAllBlurPreviews()
+        detectionReport = report
+        phase = .detected(report)
     }
 
     // MARK: - Annotations
 
-    enum RedactionSource { case auto, manual }
-
+    /// Adds a redaction and returns it, or nil when PDFKit did not actually attach it to the
+    /// page (nothing is tracked or counted in that case).
     @discardableResult
-    func addRedaction(rect: CGRect, on page: PDFPage, source: RedactionSource = .manual) -> PDFAnnotation {
-        let padded = rect.insetBy(dx: -1, dy: -1)
-        let ann: PDFAnnotation
-        switch redactionStyle {
-        case .blackRectangle:
-            let blackAnn = BlackRedactionAnnotation(bounds: padded, forType: .square, withProperties: nil)
-            blackAnn.border = nil
-            ann = blackAnn
-        case .blur:
-            let blurAnn = BlurRedactionAnnotation(bounds: padded, forType: .square, withProperties: nil)
-            blurAnn.border = nil
-            blurAnn.blurredPageImage = blurredImage(for: page)
-            blurAnn.pageMediaBoxRect = page.bounds(for: .mediaBox)
-            ann = blurAnn
+    func addRedaction(rect: CGRect, on page: PDFPage, source: RedactionSource = .manual) -> PDFAnnotation? {
+        // Only pages of the working document are exported; anything else would be counted
+        // but never burned in.
+        guard pageNumber(of: page) != nil else {
+            if source == .manual { phase = .failed("Could not add the redaction to \(pageLabel(of: page))") }
+            return nil
         }
-        page.addAnnotation(ann)
-        redactionAnnotations.append((page, ann))
-
-        let count = redactionAnnotations.count
-        switch phase {
-        case .loaded, .saved:
-            if source == .manual { phase = .redacted(spanCount: 0, rectCount: count) }
-        case .redacted:
-            phase = .redacted(spanCount: 0, rectCount: count)
-        default:
-            break
+        let ann = makeAnnotation(bounds: rect.insetBy(dx: -1, dy: -1), on: page)
+        guard Self.attach(ann, to: page) else {
+            if source == .manual {
+                phase = .failed("Could not add the redaction to \(pageLabel(of: page))")
+            }
+            return nil
         }
+        redactions.append(TrackedRedaction(page: page, annotation: ann, source: source))
+        // During detection the previews are computed once at the end (finishDetection).
+        if phase != .detecting { refreshBlurPreviews(on: page) }
+        noteManualEdit()
         return ann
     }
 
     func removeRedaction(_ ann: PDFAnnotation, on page: PDFPage) {
         page.removeAnnotation(ann)
-        redactionAnnotations.removeAll { $0.annotation === ann }
-        if redactionAnnotations.isEmpty, document != nil {
-            phase = .loaded
-        } else if case .redacted = phase {
-            phase = .redacted(spanCount: 0, rectCount: redactionAnnotations.count)
+        if page.annotations.contains(where: { $0 === ann }) {
+            // Still visible and still going to be baked: keep tracking it, and say so.
+            phase = .failed("Could not remove the redaction on \(pageLabel(of: page))")
+            return
         }
+        redactions.removeAll { $0.annotation === ann }
+        refreshBlurPreviews(on: page)
+        noteManualEdit()
     }
 
     func isRedaction(_ ann: PDFAnnotation) -> Bool {
-        redactionAnnotations.contains { $0.annotation === ann }
+        redactions.contains { $0.annotation === ann }
     }
 
+    /// "Clear all redactions": removes manual and automatic ones.
     func clearRedactions() {
         cancelDetection()
-        clearRedactions(silently: false)
+        let leftOver = removeRedactions { _ in true }
+        guard document != nil else { return }
+        detectionReport = nil
+        phase = leftOver == 0 ? .loaded : .failed("Some redactions could not be removed")
     }
 
-    private func clearRedactions(silently: Bool) {
-        for (page, ann) in redactionAnnotations {
-            page.removeAnnotation(ann)
-        }
-        redactionAnnotations.removeAll()
-        if !silently, document != nil { phase = .loaded }
-    }
-
-    private func restyleAllAnnotations() {
-        let priorPhase = phase
-        let snapshot = redactionAnnotations
-        redactionAnnotations.removeAll()
-        for (page, ann) in snapshot {
-            let bounds = ann.bounds.insetBy(dx: 1, dy: 1)
-            page.removeAnnotation(ann)
-            addRedaction(rect: bounds, on: page, source: .auto)
-        }
-        phase = priorPhase
-    }
-
-    // MARK: - Bounding rects via character offsets (with text-search fallback)
-
-    private func boundingRects(for span: DetectedSpan, source: PageTextSource, on page: PDFPage) -> [CGRect] {
-        switch source {
-        case .nativeText(let pageText):
-            if span.start >= 0,
-               span.end > span.start,
-               let utf16Range = nsRange(start: span.start, end: span.end, in: pageText),
-               let selection = page.selection(for: utf16Range) {
-                let rects = perLineRects(of: selection, on: page)
-                if !rects.isEmpty { return rects }
-            }
-            return rectsByTextSearch(needle: span.text, on: page)
-
-        case .ocr(let ocrPage):
-            let normRects = ocrPage.normalizedBoxes(start: span.start, end: span.end)
-            let pageBounds = page.bounds(for: .mediaBox)
-            return normRects.map { norm in
-                CGRect(
-                    x: norm.minX * pageBounds.width,
-                    y: norm.minY * pageBounds.height,
-                    width: norm.width * pageBounds.width,
-                    height: norm.height * pageBounds.height
-                )
+    /// Removes matching redactions; returns how many could not be removed (they stay tracked).
+    @discardableResult
+    private func removeRedactions(where shouldRemove: (TrackedRedaction) -> Bool) -> Int {
+        var kept: [TrackedRedaction] = []
+        var stuck = 0
+        for item in redactions {
+            guard shouldRemove(item) else { kept.append(item); continue }
+            item.page.removeAnnotation(item.annotation)
+            if item.page.annotations.contains(where: { $0 === item.annotation }) {
+                kept.append(item)
+                stuck += 1
             }
         }
+        redactions = kept
+        return stuck
     }
 
-    private func nsRange(start: Int, end: Int, in text: String) -> NSRange? {
-        guard start <= text.count, end <= text.count, start <= end else { return nil }
-        let s = text.index(text.startIndex, offsetBy: start)
-        let e = text.index(text.startIndex, offsetBy: end)
-        let utf16Start = text.utf16.distance(from: text.utf16.startIndex, to: s.samePosition(in: text.utf16) ?? text.utf16.startIndex)
-        let utf16End = text.utf16.distance(from: text.utf16.startIndex, to: e.samePosition(in: text.utf16) ?? text.utf16.startIndex)
-        return NSRange(location: utf16Start, length: utf16End - utf16Start)
-    }
-
-    private func perLineRects(of selection: PDFSelection, on page: PDFPage) -> [CGRect] {
-        var rects: [CGRect] = []
-        for line in selection.selectionsByLine() {
-            for selPage in line.pages where selPage === page {
-                let bounds = line.bounds(for: selPage)
-                if bounds.width > 0.5 && bounds.height > 0.5 {
-                    rects.append(bounds)
-                }
-            }
+    /// A manual edit invalidates a saved/failed status but keeps a detection report visible.
+    private func noteManualEdit() {
+        switch phase {
+        case .saved, .failed: phase = detectionReport.map { .detected($0) } ?? .loaded
+        default: break
         }
-        return rects
     }
 
-    private func rectsByTextSearch(needle: String, on page: PDFPage) -> [CGRect] {
-        guard let doc = page.document, !needle.isEmpty else { return [] }
-        let selections = doc.findString(needle, withOptions: [.caseInsensitive])
-        var rects: [CGRect] = []
-        for selection in selections {
-            rects.append(contentsOf: perLineRects(of: selection, on: page))
+    private func makeAnnotation(bounds: CGRect, on page: PDFPage) -> PDFAnnotation {
+        switch redactionStyle {
+        case .blackRectangle:
+            let blackAnn = BlackRedactionAnnotation(bounds: bounds, forType: .square, withProperties: nil)
+            blackAnn.border = nil
+            return blackAnn
+        case .blur:
+            // Its image is filled in by refreshBlurPreviews once it is attached and grouped.
+            let blurAnn = BlurRedactionAnnotation(bounds: bounds, forType: .square, withProperties: nil)
+            blurAnn.border = nil
+            return blurAnn
         }
-        return rects
     }
 
-    private func rectsViaOCRFallback(for spans: [DetectedSpan], on page: PDFPage) async -> [(CGRect, DetectedSpan)] {
-        guard let ocrPage = await ocrText(for: page), !ocrPage.combinedText.isEmpty else { return [] }
-        let pageBounds = page.bounds(for: .mediaBox)
-        let text = ocrPage.combinedText
-        var results: [(CGRect, DetectedSpan)] = []
-        for span in spans where !span.text.isEmpty {
-            var searchStart = text.startIndex
-            while let r = text.range(of: span.text, options: [.caseInsensitive], range: searchStart..<text.endIndex) {
-                let s = text.distance(from: text.startIndex, to: r.lowerBound)
-                let e = text.distance(from: text.startIndex, to: r.upperBound)
-                for norm in ocrPage.normalizedBoxes(start: s, end: e) {
-                    results.append((CGRect(
-                        x: norm.minX * pageBounds.width,
-                        y: norm.minY * pageBounds.height,
-                        width: norm.width * pageBounds.width,
-                        height: norm.height * pageBounds.height
-                    ), span))
-                }
-                searchStart = r.upperBound
-            }
-        }
-        return results
+    /// Adds the annotation and reports whether PDFKit really attached it (it silently refuses
+    /// on permission-restricted documents).
+    static func attach(_ ann: PDFAnnotation, to page: PDFPage) -> Bool {
+        page.addAnnotation(ann)
+        return page.annotations.contains { $0 === ann }
     }
 
-    // MARK: - Blurred page snapshot (for editor preview)
-
-    private func blurredImage(for page: PDFPage) -> CGImage? {
-        if let cached = blurCache.object(forKey: page) { return cached }
-
-        let pageBounds = page.bounds(for: .mediaBox)
-        let scale: CGFloat = 2.0
-        let pixelWidth = Int(pageBounds.width * scale)
-        let pixelHeight = Int(pageBounds.height * scale)
-        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
-
-        let detached = redactionAnnotations.filter { $0.page === page }.map { $0.annotation }
-        for ann in detached { page.removeAnnotation(ann) }
-        defer { for ann in detached { page.addAnnotation(ann) } }
-
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil,
-            width: pixelWidth,
-            height: pixelHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-
-        ctx.setFillColor(NSColor.white.cgColor)
-        ctx.fill(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
-        ctx.scaleBy(x: scale, y: scale)
-        page.draw(with: .mediaBox, to: ctx)
-
-        guard let sharpCG = ctx.makeImage() else { return nil }
-        guard let blurred = gaussianBlurred(sharpCG) else { return nil }
-
-        blurCache.setObject(blurred, forKey: page)
-        return blurred
-    }
-
-    private func gaussianBlurred(_ sharp: CGImage) -> CGImage? {
-        let sharpCI = CIImage(cgImage: sharp)
-        let blur = CIFilter.gaussianBlur()
-        blur.inputImage = sharpCI
-        blur.radius = Float(min(sharp.width, sharp.height)) * 0.02
-        guard let blurredCI = blur.outputImage?.cropped(to: sharpCI.extent) else { return nil }
-        let ciContext = CIContext(options: [.useSoftwareRenderer: false])
-        return ciContext.createCGImage(blurredCI, from: blurredCI.extent)
-    }
-
-    // MARK: - True (rasterized) save
-
-    private func saveSecurely(to url: URL, options: ExportOptions) -> URL? {
+    /// 1-based page number in the working document, or nil for a page that isn't in it.
+    func pageNumber(of page: PDFPage) -> Int? {
         guard let doc = document else { return nil }
-        let newDoc = PDFDocument()
-        newDoc.documentAttributes = options.removeMetadata ? [:] : doc.documentAttributes
-
-        for pageIndex in 0..<doc.pageCount {
-            guard let page = doc.page(at: pageIndex) else { continue }
-            let rectsForPage = redactionAnnotations
-                .filter { $0.page === page }
-                .map { $0.annotation.bounds }
-
-            if rectsForPage.isEmpty && !options.removeMetadata {
-                if let copy = page.copy() as? PDFPage {
-                    newDoc.insert(copy, at: newDoc.pageCount)
-                }
-            } else {
-                guard let baked = bakedPage(page, rects: rectsForPage, style: redactionStyle) else {
-                    return nil
-                }
-                newDoc.insert(baked, at: newDoc.pageCount)
-            }
-        }
-
-        return newDoc.write(to: url) ? url : nil
+        let index = doc.index(for: page)
+        return index == NSNotFound ? nil : index + 1
     }
 
-    private func bakedPage(_ page: PDFPage, rects: [CGRect], style: RedactionStyle) -> PDFPage? {
+    private func pageLabel(of page: PDFPage) -> String {
+        pageNumber(of: page).map { "page \($0)" } ?? "a page outside the open document"
+    }
+
+    /// Swaps every annotation for one of the new style. The new one is attached before the old
+    /// one is removed, so a failure can never leave an area unredacted.
+    private func restyleAllAnnotations() {
+        var updated: [TrackedRedaction] = []
+        var failures = 0
+        for item in redactions {
+            let replacement = makeAnnotation(bounds: item.annotation.bounds, on: item.page)
+            if Self.attach(replacement, to: item.page) {
+                item.page.removeAnnotation(item.annotation)
+                if item.page.annotations.contains(where: { $0 === item.annotation }) { updated.append(item) }
+                updated.append(TrackedRedaction(page: item.page, annotation: replacement, source: item.source))
+            } else {
+                failures += 1
+                updated.append(item)
+            }
+        }
+        redactions = updated
+        refreshAllBlurPreviews()
+        if failures > 0 {
+            phase = .failed("\(failures) redaction(s) could not be restyled; they are kept and will still be applied")
+        }
+    }
+
+    // MARK: - Rendering
+
+    /// The pristine twin of a working page.
+    func pristinePage(for page: PDFPage) -> PDFPage? {
+        guard let number = pageNumber(of: page) else { return nil }
+        return pristineDocument?.page(at: number - 1)
+    }
+
+    /// Pixel region the bake obscures for an annotation (bounds + 2 px), at `scale`.
+    static func bakeRegion(for bounds: CGRect, scale: CGFloat) -> CGRect {
+        CGRect(x: bounds.minX * scale, y: bounds.minY * scale, width: bounds.width * scale, height: bounds.height * scale)
+            .insetBy(dx: -2, dy: -2)
+    }
+
+    private func refreshAllBlurPreviews() {
+        var pages: [PDFPage] = []
+        for item in redactions where !pages.contains(where: { $0 === item.page }) { pages.append(item.page) }
+        for page in pages { refreshBlurPreviews(on: page) }
+    }
+
+    /// Gives every blur annotation on the page the same group image the export bake will use
+    /// (overlapping/touching redactions share one mosaic, so the editor shows no seams either).
+    private func refreshBlurPreviews(on page: PDFPage) {
+        guard redactionStyle == .blur, let clean = pristinePage(for: page) else { return }
+        let items = redactions.filter { $0.page === page }
+        guard !items.isEmpty else { return }
+        let scale = PDFPageRenderer.scale(for: clean.bounds(for: .mediaBox).size)
+        let sharp: CGImage
+        if let cached = renderCache.object(forKey: page) {
+            sharp = cached
+        } else {
+            guard let rendered = PDFPageRenderer.render(clean, scale: scale) else { return }
+            renderCache.setObject(rendered, forKey: page)
+            sharp = rendered
+        }
+        let imageBounds = CGRect(x: 0, y: 0, width: sharp.width, height: sharp.height)
+        let regions = items.map { Self.bakeRegion(for: $0.annotation.bounds, scale: scale) }
+        guard let groups = PDFPageRenderer.obscuredGroups(regions, in: sharp) else { return }
+        for (item, region) in zip(items, regions) {
+            guard let ann = item.annotation as? BlurRedactionAnnotation else { continue }
+            let key = region.integral.intersection(imageBounds)
+            guard let group = groups.first(where: { $0.regions.contains(key) }) else { continue }
+            ann.blurredPageImage = group.image
+            ann.pageMediaBoxRect = CGRect(x: group.frame.minX / scale, y: group.frame.minY / scale,
+                                          width: group.frame.width / scale, height: group.frame.height / scale)
+            ann.bounds = ann.bounds  // re-set so PDFKit redraws the annotation
+        }
+    }
+
+    // MARK: - True (rasterized) bake
+
+    /// Rasterizes a pristine (normalized, unannotated) page and burns the rects in.
+    private func bakedImage(_ page: PDFPage, rects: [CGRect], style: RedactionStyle) -> CGImage? {
         let pageBounds = page.bounds(for: .mediaBox)
-        let scale: CGFloat = 2.0
-        let pixelWidth = Int(pageBounds.width * scale)
-        let pixelHeight = Int(pageBounds.height * scale)
-        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+        let scale = PDFPageRenderer.scale(for: pageBounds.size)
+        guard PDFNormalizer.isNormalized(page),
+              let ctx = PDFPageRenderer.whiteContext(size: pageBounds.size, scale: scale) else { return nil }
+        // Pixel dimensions are rounded, so scale x and y separately to fill the bitmap exactly.
+        let sx = CGFloat(ctx.width) / pageBounds.width
+        let sy = CGFloat(ctx.height) / pageBounds.height
 
-        let detached = redactionAnnotations.filter { $0.page === page }.map { $0.annotation }
-        for ann in detached { page.removeAnnotation(ann) }
-        defer { for ann in detached { page.addAnnotation(ann) } }
-
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil,
-            width: pixelWidth,
-            height: pixelHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-
-        ctx.setFillColor(NSColor.white.cgColor)
-        ctx.fill(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
         ctx.saveGState()
-        ctx.scaleBy(x: scale, y: scale)
+        ctx.scaleBy(x: sx, y: sy)
         page.draw(with: .mediaBox, to: ctx)
         ctx.restoreGState()
 
         let pixelRects: [CGRect] = rects.map { r in
-            CGRect(x: r.minX * scale, y: r.minY * scale,
-                   width: r.width * scale, height: r.height * scale)
+            CGRect(x: r.minX * sx, y: r.minY * sy, width: r.width * sx, height: r.height * sy)
                 .insetBy(dx: -2, dy: -2)
         }
 
@@ -548,20 +575,10 @@ final class PDFRedactor {
             for r in pixelRects { ctx.fill(r) }
 
         case .blur:
-            guard let sharpCG = ctx.makeImage() else { return nil }
-            guard let blurredCG = gaussianBlurred(sharpCG) else { return nil }
-
-            for r in pixelRects {
-                ctx.saveGState()
-                ctx.clip(to: r)
-                ctx.draw(blurredCG, in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
-                ctx.restoreGState()
-            }
+            guard let sharpCG = ctx.makeImage(),
+                  PDFPageRenderer.obscure(pixelRects, in: ctx, from: sharpCG) else { return nil }
         }
-
-        guard let finalCG = ctx.makeImage() else { return nil }
-        let image = NSImage(cgImage: finalCG, size: pageBounds.size)
-        return PDFPage(image: image)
+        return ctx.makeImage()
     }
 
     private func suggestedSaveName() -> String {

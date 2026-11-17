@@ -42,7 +42,7 @@ struct FloatingToolbar: View {
                 }
                 .padding(.horizontal, 4)
             }
-            .disabled(!hasFile)
+            .disabled(!hasFile || isDetecting)
             .keyboardShortcut("s", modifiers: [.command])
             .help("Save redacted copy  ⌘S")
         }

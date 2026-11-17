@@ -91,9 +91,12 @@ struct MainView: View {
         let type = (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType) ?? .data
         if type.conforms(to: .pdf) {
             inputMode = .pdf
-            if pdfRedactor.loadPDF(from: url) {
-                recents.add(url: url, kind: .pdf)
-                showHome = false
+            // Loading may show a modal password prompt; don't run it inside the drop callback.
+            DispatchQueue.main.async {
+                if pdfRedactor.loadPDF(from: url) {
+                    recents.add(url: url, kind: .pdf)
+                    showHome = false
+                }
             }
         } else if type.conforms(to: .image) {
             inputMode = .image

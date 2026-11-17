@@ -1,18 +1,9 @@
 import Foundation
 @preconcurrency import OpenMedKit
 
-struct DetectedSpan: Identifiable, Equatable {
-    let id = UUID()
-    let category: String
-    let text: String
-    let start: Int
-    let end: Int
-    let confidence: Float
-}
-
 @Observable
 @MainActor
-final class PIIDetector {
+final class PIIDetector: PIIDetecting {
     enum Phase: Equatable {
         case needsDownload
         case downloading(downloaded: Int64, total: Int64)
@@ -160,13 +151,5 @@ final class PIIDetector {
 
     private func ensureCacheDirectoryExists() {
         try? FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
-    }
-}
-
-enum HMDError: LocalizedError {
-    case message(String)
-    var errorDescription: String? {
-        if case .message(let s) = self { return s }
-        return nil
     }
 }

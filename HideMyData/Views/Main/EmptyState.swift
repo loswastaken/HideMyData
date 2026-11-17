@@ -28,7 +28,11 @@ struct EmptyState: View {
                 Spacer().frame(height: 18)
             }
 
-            UpdateStatusFooter()
+            Text("v\(appVersion)")
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
                 .padding(.bottom, 14)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -101,6 +105,10 @@ struct EmptyState: View {
         )
         .scaleEffect(isTargeted ? 1.015 : 1.0)
         .animation(.smooth(duration: 0.22), value: isTargeted)
+    }
+
+    private var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
     }
 
     private var openIcon: String {

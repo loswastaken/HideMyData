@@ -21,3 +21,10 @@ jobs:
 
       - name: Lint
         run: swiftlint --strict
+
+      # MLX (via OpenMedKit) compiles Metal shaders; the toolchain is a separate Xcode component.
+      - name: Install Metal Toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Build and test (ad-hoc signed, no team required)
+        run: xcodebuild -project HideMyData.xcodeproj -scheme HideMyData -configuration Debug -derivedDataPath build/DerivedData test
